@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Vincent Taverna
-// Wisp server (wisp-js) behind a secret path: wss://HOST/$WISP_PATH/ is the Wisp endpoint,
-// https://HOST/$WISP_PATH/status says whether the VPN is up, what start.sh found in its
-// config (shape only) and which address the internet sees.
+// Wisp server (wisp-js) behind a password in the URL: wss://HOST/PASSWORD/ is the Wisp
+// endpoint (a browser's WebSocket can send no header, so the URL carries it), and
+// https://HOST/PASSWORD/status says whether the VPN is up, what start.sh found in its
+// config (shape only) and which address the internet sees. The password is the secret
+// WISP_PASS, else WISP_PATH. /health, open to all, says only that the server runs.
 import http from "node:http";
 import https from "node:https";
 import { execFileSync } from "node:child_process";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { server as wisp } from "@mercuryworkshop/wisp-js/server";
 wisp.options.dns_result_order = "ipv4first";
-const prefix = "/" + process.env.WISP_PATH + "/";
+const pass = (process.env.WISP_PASS || process.env.WISP_PATH || "").trim();
+if (pass.length < 12) { console.error("WISP_PASS must be at least 12 characters"); }
+const digest = (t) => createHash("sha256").update(t).digest();
+/** The rest of the URL after /PASSWORD/, or null when the password is wrong. */
+const authed = (url) => {
+	const m = /^\/([^/?]+)\/(.*)$/.exec(url ?? "");
+	if (!m || pass.length < 12) return null;
+	let given; try { given = decodeURIComponent(m[1]); } catch { return null; }
+	return timingSafeEqual(digest(given), digest(pass)) ? m[2] : null;
+};
 const vpn = process.env.WISP_VPN ?? "off";
 const egress = () => new Promise((resolve) => {
 	const q = https.get("https://api.ipify.org", { family: 4, timeout: 8000 }, (r) => { let b = ""; r.on("data", (d) => (b += d)); r.on("end", () => resolve(b.trim())); });
@@ -23,12 +35,17 @@ const tunnel = () => {
 	} catch { return null; }
 };
 const s = http.createServer(async (q, r) => {
-	if (q.url !== prefix + "status") { r.writeHead(404); r.end(); return; }
+	if (q.url === "/health") {
+		r.writeHead(200, { "Content-Type": "application/json" });
+		r.end(JSON.stringify({ ok: true, auth: pass.length < 12 ? "none: refusing everything" : process.env.WISP_PASS ? "WISP_PASS" : "WISP_PATH", vpn }) + "\n");
+		return;
+	}
+	if (authed(q.url) !== "status") { r.writeHead(404); r.end(); return; }
 	let report = [];
 	try { report = readFileSync("/tmp/vpn-report.txt", "utf8").trim().split("\n").filter(Boolean); } catch { /* none */ }
 	r.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
 	r.end(JSON.stringify({ vpn, egress: await egress(), region: process.env.FLY_REGION, tunnel: vpn === "off" ? null : tunnel(), report }, null, 1) + "\n");
 });
 // A VPN that was asked for and is not up: no Wisp, rather than Fly's own address.
-s.on("upgrade", (q, sock, head) => { if (vpn !== "failed" && q.url.startsWith(prefix)) wisp.routeRequest(q, sock, head); else sock.destroy(); });
+s.on("upgrade", (q, sock, head) => { if (vpn !== "failed" && authed(q.url) !== null) wisp.routeRequest(q, sock, head); else sock.destroy(); });
 s.listen(8080, "0.0.0.0", () => console.log("wisp listening, vpn " + vpn));

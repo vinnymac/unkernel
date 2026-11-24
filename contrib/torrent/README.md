@@ -17,14 +17,16 @@ The guest reaches peers through the page's Wisp proxy, so open the page with
 on a Fly machine (image `node:24-alpine`, both files in `/app`, command
 `sh /app/start.sh`, internal port 8080 behind a TLS + HTTP service on 443):
 
-- `WISP_PATH` (env): a random string. Only `wss://APP.fly.dev/WISP_PATH/` is
-  served, so the proxy is not open to anyone who finds the host.
+- `WISP_PASS` (secret): a password of at least 12 characters (letters,
+  digits, `-` and `_`). Only `wss://APP.fly.dev/WISP_PASS/` is served, so
+  the proxy is not open to anyone who finds the host. A browser's WebSocket
+  cannot send a header, which is why the URL carries it.
 - `WG_CONF` (secret, optional): a WireGuard client config in wg-quick format.
   With it every connection made for the guest, TCP and UDP, leaves through
   that tunnel, with a kill switch; if the tunnel cannot be set up the proxy
   refuses Wisp connections rather than use Fly's address. A config whose line
   breaks were lost when the secret was set is repaired.
-- `https://APP.fly.dev/WISP_PATH/status` shows whether the VPN is up, the
+- `https://APP.fly.dev/WISP_PASS/status` shows whether the VPN is up, the
   address the internet sees, the tunnel's last handshake and what was found
   in the config (its shape, never its values).
 
