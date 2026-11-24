@@ -17,10 +17,18 @@ if (pass.length < 12) { console.error("WISP_PASS must be at least 12 characters"
 const digest = (t) => createHash("sha256").update(t).digest();
 /** The rest of the URL after /PASSWORD/, or null when the password is wrong. */
 const authed = (url) => {
-	const m = /^\/([^/?]+)\/(.*)$/.exec(url ?? "");
+	const m = /^\/([^/?]+)(?:\/(.*))?$/.exec(url ?? "");
 	if (!m || pass.length < 12) return null;
 	let given; try { given = decodeURIComponent(m[1]); } catch { return null; }
-	return timingSafeEqual(digest(given), digest(pass)) ? m[2] : null;
+	return timingSafeEqual(digest(given), digest(pass)) ? m[2] ?? "" : null;
+};
+/** How a rejected URL differs from the password, for /health: its shape only. */
+const mismatch = (url) => {
+	const seg = /^\/([^/?]*)/.exec(url ?? "")?.[1] ?? "";
+	let given = seg; try { given = decodeURIComponent(seg); } catch { /* as sent */ }
+	if (!given) return "no password in the URL";
+	if (given.length !== pass.length) return given.length < pass.length ? "shorter than the password" : "longer than the password";
+	return given.toLowerCase() === pass.toLowerCase() ? "letter case differs" : "same length, different characters";
 };
 const vpn = process.env.WISP_VPN ?? "off";
 const egress = () => new Promise((resolve) => {
@@ -35,7 +43,7 @@ const tunnel = () => {
 	} catch { return null; }
 };
 /** Counts for /health: enough to see why a page cannot connect, nothing about who or where to. */
-const seen = { accepted: 0, wrongPassword: 0, refusedVpnDown: 0, lastAccepted: null, lastRejected: null, origins: {} };
+const seen = { accepted: 0, wrongPassword: 0, refusedVpnDown: 0, lastAccepted: null, lastRejected: null, origins: {}, rejectedBecause: {} };
 const s = http.createServer(async (q, r) => {
 	if (q.url === "/health") {
 		r.writeHead(200, { "Content-Type": "application/json" });
@@ -53,8 +61,17 @@ const s = http.createServer(async (q, r) => {
 s.on("upgrade", (q, sock, head) => {
 	const now = new Date().toISOString(), origin = String(q.headers.origin ?? "none").slice(0, 80);
 	seen.origins[origin] = (seen.origins[origin] ?? 0) + 1;
-	if (authed(q.url) === null) { seen.wrongPassword++; seen.lastRejected = now; sock.destroy(); }
+	if (authed(q.url) === null) {
+		const why = mismatch(q.url);
+		seen.wrongPassword++; seen.lastRejected = now; seen.rejectedBecause[why] = (seen.rejectedBecause[why] ?? 0) + 1;
+		sock.destroy();
+	}
 	else if (vpn === "failed") { seen.refusedVpnDown++; seen.lastRejected = now; sock.destroy(); }
-	else { seen.accepted++; seen.lastAccepted = now; wisp.routeRequest(q, sock, head); }
+	else {
+		seen.accepted++; seen.lastAccepted = now;
+		// wisp-js serves Wisp only on a path that ends in "/": add it when the URL left it out.
+		q.url = q.url.replace(/^(\/[^/?]+)\/?.*$/, "$1/");
+		wisp.routeRequest(q, sock, head);
+	}
 });
 s.listen(8080, "0.0.0.0", () => console.log("wisp listening, vpn " + vpn));
