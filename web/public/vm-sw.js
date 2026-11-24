@@ -19,10 +19,8 @@
 // saves an <a download> itself, and a navigation whose answer would be a
 // download (an attachment, or a type no browser shows) is answered with a
 // document that runs that script on the same URL (vm-save.js has the how).
-//
-// A preview document's link to a root-relative URL (/files/) leaves /vm/:
-// such a navigation, known by its referrer, is redirected to the same path
-// on that document's guest port.
+// That document replaces the one that linked to it, and it asks the guest
+// for the URL a second time, so a link that works once is not saved.
 //
 // Stateless on purpose: browsers stop idle service workers, so every fetch
 // asks the open windows again. Each window that is not itself a preview
@@ -62,7 +60,7 @@ const SHIM = "/vm-ws.js";
 /** The download helper (public/vm-save.js): always from the network too. */
 const SAVE = "/vm-save.js";
 /** Navigations answered with these types are shown by the browser; other application/ types and attachments are downloads. */
-const SHOWN = /^\s*(?:text\/|image\/|audio\/|video\/|font\/|multipart\/|application\/(?:json|pdf|xml|xhtml\+xml|javascript|ecmascript|wasm|manifest\+json|ld\+json|rss\+xml|atom\+xml|x-www-form-urlencoded)\b|application\/[a-z0-9.-]+\+(?:json|xml)\b)/i;
+const SHOWN = /^\s*(?:text\/|image\/|audio\/|video\/|font\/|multipart\/|application\/(?:json|pdf|xml|xhtml\+xml|javascript|x-javascript|ecmascript|wasm|ogg|manifest\+json|ld\+json|rss\+xml|atom\+xml|x-www-form-urlencoded|x-mpegurl|vnd\.apple\.mpegurl)\b|application\/[a-z0-9.-]+\+(?:json|xml)\b)/i;
 /** How far into a document the doctype is looked for before the shim goes at the start. */
 const SNIFF_BYTES = 1024;
 
@@ -94,11 +92,6 @@ self.addEventListener("fetch", (event) => {
 		// A preview document's root-relative request: to its guest port. Its
 		// clientId is that document (or a worker it started); a navigation has none.
 		if (!LEGACY && event.clientId && url.pathname !== SHIM && url.pathname !== SAVE && event.request.mode !== "navigate") event.respondWith(fromPreview(event, url));
-		// A preview document's root-relative link: back under its prefix.
-		else if (!LEGACY && event.request.mode === "navigate") {
-			const from = referrerPreview(event.request);
-			if (from) event.respondWith(Response.redirect(new URL(`/vm/${from[1]}/${from[2]}${url.pathname}${url.search}`, url).href, 307));
-		}
 		return; // otherwise not a preview URL: the network, as if there were no worker
 	}
 	// /vm/<id>/<port> without the slash: relative URLs in the page need it.
@@ -115,15 +108,6 @@ self.addEventListener("message", (event) => {
 	if (!port || d?.t !== "kw-check") return;
 	port.postMessage({ t: "kw-check", update: LEGACY, offline: false });
 });
-
-/** The preview document a navigation comes from (its referrer), as PREVIEW_RE's match, or null. */
-function referrerPreview(req) {
-	try {
-		const r = new URL(req.referrer);
-		const m = r.origin === location.origin ? PREVIEW_RE.exec(r.pathname) : null;
-		return m && m[3] !== undefined ? m : null;
-	} catch { return null; }
-}
 
 /** A request of a document this worker controls: relayed if that document is a preview, else from the network. */
 async function fromPreview(event, url) {
@@ -290,7 +274,13 @@ function saver(path, headers) {
 <style>body{font:17px/1.5 system-ui,sans-serif;margin:2em 1.5em 6em;background:#000;color:#ededed}a{color:#4ad}</style>
 <h1 style="font-size:1.2em;overflow-wrap:anywhere">${esc(name)}</h1>
 <p>Reading this file out of the guest. It is then saved to this device like any download.</p>
-<p><a href="#" onclick="history.length > 1 ? history.back() : close(); return false">Back</a></p>
+<p><a id="back" href="#" hidden>Back</a></p>
+<script>
+// Back only to the preview document that led here: in the page's iframe, history.back() without one would leave the page.
+{ let from = ""; try { from = new URL(document.referrer).pathname; } catch { /* none */ }
+	const a = document.getElementById("back");
+	if (from.startsWith("/vm/")) { a.hidden = false; a.onclick = () => { history.back(); return false; }; } }
+</script>
 <script src="${SAVE}" data-kw-save="1" data-kw-name="${esc(name)}" data-kw-size="${Number(headers.get("content-length")) || 0}"></script>`;
 	return new Response(html, {
 		headers: {

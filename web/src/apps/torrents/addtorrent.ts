@@ -11,15 +11,15 @@ import { DAEMON_SH, PACKAGES, RPC_PORT } from "./daemon.ts";
 const ADD_SH = `#!/bin/sh
 # Asks for torrents and adds them to the Transmission daemon.
 ./daemon.sh || exit 1
-tr() { transmission-remote ${RPC_PORT} "$@"; }
+rpc() { transmission-remote ${RPC_PORT} "$@"; }
 while :; do
 	echo
-	tr -l
+	rpc -l
 	echo
 	printf 'A torrent URL or a magnet link (Enter: list again): '
 	IFS= read -r src || break
 	[ -n "$src" ] || continue
-	tr -a "$src" || echo "Not added."
+	rpc -a "$src" || echo "Not added."
 	sleep 2
 done
 `;

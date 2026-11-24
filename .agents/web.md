@@ -2019,10 +2019,9 @@ option.
   itself, and a navigation whose answer would be a download (an attachment,
   or an `application/` type no browser shows) is answered with a document
   that runs it: the file is read through the relay into OPFS (`kw-save`,
-  one copy at a time) and downloaded from a blob: link.
-- A preview document's root-relative link (a navigation outside `/vm/`
-  whose referrer is a preview document) is redirected to the same path on
-  that document's guest port.
+  copies kept ten minutes) and downloaded from a blob: link. The saver
+  document replaces the one that linked to it and asks the guest for the
+  URL a second time.
 - Relay: `public/vm-sw.js`, a plain script served at `/vm-sw.js`, outside
   the TypeScript build: the page's one service worker (scope `/vm/`;
   Service worker and updates). The relay is stateless, because

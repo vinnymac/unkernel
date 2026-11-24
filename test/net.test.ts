@@ -194,6 +194,14 @@ test("UDP is relayed per flow by a backend with udp(); a refused flow gets port 
 	assert.equal(stack.udp.size, 0);
 });
 
+test("UDP: a backend that closes a flow inside udp() leaves none behind", () => {
+	const { stack, out } = mkStack({ udp: (_addr, ev) => { ev.onClose(new Error("no UDP here")); return { send() { assert.fail("sent on a closed flow"); }, close() {} }; } });
+	stack.send(udp(5000, ip4("93.184.215.14"), 6969, new Uint8Array(1)));
+	assert.equal(out.length, 1);
+	assert.equal(out[0]!.icmpType, 3);
+	assert.equal(stack.udp.size, 0);
+});
+
 test("UDP flows: the least recently used is dropped at the limit", () => {
 	const closed: number[] = [];
 	const { stack } = mkStack({ udp: ({ port }) => ({ send() {}, close() { closed.push(port); } }) });

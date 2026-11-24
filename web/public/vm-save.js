@@ -8,10 +8,13 @@
 // relays, and answers a navigation that would be a download (an attachment,
 // or a type no browser shows) with a small document that runs it. Either
 // way save() fetches the file itself, which does go through the relay, into
-// the origin's private on-disk storage (OPFS, directory kw-save: one copy
-// at a time, an earlier one is deleted first), and then has the browser
-// download that copy from a blob: link, which every engine does by itself.
-//   - a click on <a download href> of this origin: saved here instead;
+// the origin's private on-disk storage (OPFS, directory kw-save, under a
+// name of its own; copies older than KEEP_MS are deleted when a save
+// starts, since the browser may still be copying a newer one), and then has
+// the browser download that copy from a blob: link, which every engine does
+// by itself.
+//   - a plain click on <a download href> of this origin that the page's own
+//     handlers left alone: saved here instead;
 //   - the saver document: <script src="/vm-save.js" data-kw-save="1"
 //     data-kw-name data-kw-size>, which saves location.href.
 // OPFS is written through a worker's synchronous handle, else through
@@ -23,6 +26,8 @@
 	"use strict";
 	const script = document.currentScript;
 	const DIR = "kw-save";
+	/** A copy is kept this long: the browser's own download of it may still run. */
+	const KEEP_MS = 10 * 60 * 1000;
 	const WORKER = `
 let h, pos = 0;
 onmessage = async (e) => {
@@ -38,33 +43,54 @@ onmessage = async (e) => {
 	} catch (err) { postMessage({ ok: false, error: String(err && err.message || err) }); }
 };`;
 
-	/** Where the bytes go while they are read: { kind, write(chunk), close() -> File }. */
-	async function sink(name) {
+	/**
+	 * Where the bytes go while they are read: { kind, write(chunk), close() ->
+	 * File, abort() }. The copy has a name of its own (a download's may be one
+	 * OPFS refuses, or an earlier copy's); abort() gives the handle, the worker
+	 * and the copy up.
+	 */
+	async function sink() {
 		try {
 			if (!navigator.storage || !navigator.storage.getDirectory) throw new Error("no OPFS");
 			const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle(DIR, { create: true });
-			for await (const n of dir.keys()) await dir.removeEntry(n).catch(() => {});
-			const fh = await dir.getFileHandle(name, { create: true });
+			for await (const [n, h] of dir.entries()) {
+				try { if (Date.now() - (await h.getFile()).lastModified > KEEP_MS) await dir.removeEntry(n); } catch { /* in use */ }
+			}
+			const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+			const fh = await dir.getFileHandle(id, { create: true });
+			const drop = () => dir.removeEntry(id).catch(() => {});
 			const writable = async () => {
 				const w = await fh.createWritable();
-				return { kind: "disk (stream)", write: (c) => w.write(c), close: async () => { await w.close(); return fh.getFile(); } };
+				return { kind: "disk (stream)", write: (c) => w.write(c), close: async () => { await w.close(); return fh.getFile(); }, abort: async () => { await w.abort().catch(() => {}); await drop(); } };
 			};
-			const wk = new Worker(URL.createObjectURL(new Blob([WORKER], { type: "text/javascript" })));
+			// The worker's handle is several times faster than the stream (measured in Chromium);
+			// a document whose CSP refuses the worker gets the stream.
+			let wk, src;
+			try {
+				src = URL.createObjectURL(new Blob([WORKER], { type: "text/javascript" }));
+				wk = new Worker(src);
+			} catch (e) {
+				if (src) URL.revokeObjectURL(src);
+				if (fh.createWritable) return await writable();
+				throw e;
+			}
+			const stop = () => { wk.terminate(); URL.revokeObjectURL(src); };
+			// One call at a time (save() awaits each), so one pending answer.
 			const call = (m, t) => new Promise((res, rej) => {
 				wk.onmessage = (e) => (e.data.ok ? res() : rej(new Error(e.data.error)));
 				wk.onerror = (e) => rej(new Error(e.message || "worker failed"));
 				wk.postMessage(m, t || []);
 			});
-			// The worker's handle is several times faster than the stream (measured in Chromium).
-			try { await call({ op: "open", name }); } catch (e) { wk.terminate(); if (fh.createWritable) return await writable(); throw e; }
+			try { await call({ op: "open", name: id }); } catch (e) { stop(); if (fh.createWritable) return await writable(); await drop(); throw e; }
 			return {
 				kind: "disk (worker)",
 				write: (c) => { const buf = c.buffer.slice(c.byteOffset, c.byteOffset + c.byteLength); return call({ op: "write", buf }, [buf]); },
-				close: async () => { await call({ op: "close" }); wk.terminate(); return fh.getFile(); },
+				close: async () => { await call({ op: "close" }); stop(); return fh.getFile(); },
+				abort: async () => { await call({ op: "close" }).catch(() => {}); stop(); await drop(); },
 			};
 		} catch (e) {
-			const parts = [];
-			return { kind: `memory (${e.message})`, write: async (c) => { parts.push(c); }, close: async () => new File(parts, name) };
+			let parts = [];
+			return { kind: `memory (${e.message})`, write: async (c) => { parts.push(c); }, close: async () => new Blob(parts), abort: async () => { parts = []; } };
 		}
 	}
 
@@ -103,17 +129,22 @@ onmessage = async (e) => {
 	 * else the URL's last segment. Resolves with { name, size, kind, file } or throws.
 	 */
 	async function save(url, given, size) {
-		if (busy) throw new Error("another download is being read");
+		if (busy) {
+			const l = document.querySelector("#kw-save-bar span");
+			if (l && !/one at a time/.test(l.textContent)) l.textContent += " (one at a time: wait for this one)";
+			throw new Error("another download is being read");
+		}
 		busy = true;
 		document.getElementById("kw-save-bar")?.remove();
 		const ui = bar();
 		let name = given || nameOf(new URL(url, location.href));
+		let out = null;
 		try {
 			ui.label.textContent = `Reading ${name}…`;
 			const r = await fetch(url, { headers: { accept: "*/*" } });
 			if (!r.ok) throw new Error(`HTTP ${r.status}`);
 			if (!given) name = (headerName(r.headers.get("content-disposition")) || name).replace(/[/\\]/g, "_");
-			const out = await sink(name);
+			out = await sink();
 			const total = Number(r.headers.get("content-length")) || size || 0;
 			if (out.kind.startsWith("memory") && total > 200 * 1048576 &&
 				!confirm(`This browser cannot buffer the download on disk, and ${mib(total)} may not fit in memory: the page may reload. Go on?`)) throw new Error("not read");
@@ -124,21 +155,28 @@ onmessage = async (e) => {
 				await out.write(value); got += value.length;
 				if (got - shown >= 1048576) { shown = got; ui.label.textContent = `Reading ${name}: ${mib(got)}${total ? ` of ${mib(total)}` : ""}`; }
 			}
+			const length = Number(r.headers.get("content-length")) || 0;
+			if (length && got !== length && !r.headers.get("content-encoding")) throw new Error(`the guest sent ${got} of ${length} bytes`);
+			const kind = out.kind;
 			const stored = await out.close();
+			out = null; // closed: nothing to abort
 			if (stored.size !== got) throw new Error(`stored ${stored.size} of ${got} bytes`);
 			const file = new File([stored], name, { type: "application/octet-stream" }); // a reference, not a copy
 			const go = () => {
-				const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(file), download: name });
+				const href = URL.createObjectURL(file);
+				const a = Object.assign(document.createElement("a"), { href, download: name });
 				(document.body ?? document.documentElement).append(a); a.click(); a.remove();
+				setTimeout(() => URL.revokeObjectURL(href), KEEP_MS); // the browser copies it meanwhile
 			};
 			// One tap is enough where the browser lets a page start a download after the read; else Save does, with a tap of its own.
 			ui.label.textContent = `${name} (${mib(got)}) is ready. If no download started, tap Save.`;
 			ui.save.hidden = false; ui.save.onclick = go;
 			go();
-			const done = { name, size: got, kind: out.kind, file };
+			const done = { name, size: got, kind, file };
 			window.kwSaved = done;
 			return done;
 		} catch (e) {
+			await out?.abort().catch(() => {});
 			ui.label.textContent = `${name}: not saved (${e.message})`;
 			throw e;
 		} finally {
@@ -147,17 +185,19 @@ onmessage = async (e) => {
 	}
 	window.kwSave = save;
 
-	// <a download href>, of this origin: here instead of the browser's own download.
-	addEventListener("click", (e) => {
+	// <a download href>, of this origin: here instead of the browser's own
+	// download. Last of all (the bubble phase, on the document), so that a
+	// page's own handlers ran first: a click one of them took (preventDefault)
+	// or one with a modifier key is not ours.
+	document.addEventListener("click", (e) => {
 		const a = e.target instanceof Element ? e.target.closest("a[download]") : null;
-		if (!a || e.defaultPrevented || e.button !== 0) return;
+		if (!a || e.defaultPrevented || e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
 		let u;
 		try { u = new URL(a.href, location.href); } catch { return; }
 		if (u.origin !== location.origin || !/^https?:$/.test(u.protocol)) return;
 		e.preventDefault();
-		e.stopPropagation();
 		save(u.href, a.getAttribute("download") || "").catch(() => {});
-	}, true);
+	});
 
 	// The saver document.
 	if (script?.dataset.kwSave) {

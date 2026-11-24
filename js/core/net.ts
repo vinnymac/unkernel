@@ -682,7 +682,7 @@ export class NetStack implements NetDevice {
 		if (u) this.udp.delete(key); // back in below, as the most recently used
 		else {
 			let flow: NetDatagramFlow;
-			const me: { u?: UdpFlow } = {};
+			const me: { u?: UdpFlow; early?: Error | null } = {};
 			const mine = () => me.u !== undefined && this.udp.get(key) === me.u;
 			try {
 				flow = this.backend.udp!({ host, port: dport }, {
@@ -694,6 +694,7 @@ export class NetStack implements NetDevice {
 						this.sendUdp(dst, dport, src, sport, data);
 					},
 					onClose: (err) => {
+						if (!me.u) { me.early = err; return; } // inside udp(): seen below
 						if (!mine()) return;
 						const { quote, l4, replied } = me.u!;
 						this.udp.delete(key);
@@ -706,6 +707,10 @@ export class NetStack implements NetDevice {
 				});
 			} catch (e) {
 				this.log?.(`[net] udp ${ip4str(dst)}:${dport}: ${errorText(e)}`);
+				return this.icmpUnreachable(f, l4, src, dst, 3);
+			}
+			if (me.early !== undefined) {
+				if (me.early) this.log?.(`[net] udp ${ip4str(dst)}:${dport}: ${me.early.message}`);
 				return this.icmpUnreachable(f, l4, src, dst, 3);
 			}
 			u = me.u = { flow, last: 0, replied: false, quote: f, l4 };
