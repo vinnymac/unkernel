@@ -9,6 +9,7 @@
 // reason and a hint, without downloading the kernel; a boot module that
 // fails to load is reported the same way.
 import { flushSync } from "react-dom";
+import "./awake.ts";
 import { createRoot } from "react-dom/client";
 import { App } from "./components/App.tsx";
 import { readConfig } from "./config.ts";

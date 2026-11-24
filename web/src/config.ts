@@ -137,6 +137,10 @@
 //                                      Firefox and on phones; one on fewer than 4 threads),
 //                                      else one.
 //                                      ?cpus=1: one CPU, the UP kernel.
+//   ?awake=1                           URL only: hold a screen wake lock while the page is shown, so
+//                                      a phone does not lock by itself during a long job in the
+//                                      guest (awake.ts); a locked or backgrounded phone still
+//                                      freezes the page
 //   ?autosuspend=now|<s>|0             save the machine and pause it by itself once the tab has been
 //                                      hidden that long (now: at once; seconds; 0: never); it goes
 //                                      on (or, after the page was dropped, resumes) when the tab is
