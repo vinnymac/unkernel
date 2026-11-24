@@ -152,6 +152,95 @@ test("Wisp backend: fake DNS, flow-controlled writes, clean and refused closes",
 	});
 });
 
+test("UDP is relayed per flow by a backend with udp(); a refused flow gets port unreachable", async () => {
+	const flows: { addr: string; sent: string[]; ev: { onMessage(d: Uint8Array): void; onClose(e: Error | null): void }; closed: boolean }[] = [];
+	const { stack, out } = mkStack({
+		udp: ({ host, port }, ev) => {
+			const fl = { addr: `${host}:${port}`, sent: [] as string[], ev, closed: false };
+			flows.push(fl);
+			return { send: (d) => { fl.sent.push(new TextDecoder().decode(d)); }, close: () => { fl.closed = true; } };
+		},
+	});
+	const te = new TextEncoder();
+	stack.send(udp(5000, ip4("93.184.215.14"), 6969, te.encode("one")));
+	stack.send(udp(5000, ip4("93.184.215.14"), 6969, te.encode("two")));
+	stack.send(udp(5000, ip4("10.0.2.2"), 6969, te.encode("host")));   // hostLoopback
+	stack.send(udp(5000, ip4("10.0.2.9"), 6969, te.encode("subnet"))); // nothing there
+	assert.deepEqual(flows.map((f) => [f.addr, f.sent]), [["93.184.215.14:6969", ["one", "two"]], ["127.0.0.1:6969", ["host"]]]);
+	assert.equal(out.length, 1);
+	assert.equal(out[0]!.icmpType, 3);
+	out.splice(0);
+
+	flows[0]!.ev.onMessage(te.encode("reply"));
+	flows[0]!.ev.onMessage(new Uint8Array(1473)); // would need a fragment
+	assert.equal(out.length, 1);
+	assert.deepEqual([ip4str(out[0]!.src!), out[0]!.sport, out[0]!.dport, new TextDecoder().decode(out[0]!.payload)], ["93.184.215.14", 6969, 5000, "reply"]);
+	out.splice(0);
+
+	// The backend gives up on a flow that never answered: the guest's last datagram bounces.
+	flows[1]!.ev.onClose(new Error("refused"));
+	assert.equal(out.length, 1);
+	assert.equal(out[0]!.icmpType, 3);
+	assert.deepEqual([...out[0]!.f.subarray(42 + 20, 42 + 28)], [...udp(5000, ip4("10.0.2.2"), 6969, te.encode("host")).subarray(34, 42)], "quotes the UDP header");
+	// One that did answer just goes away.
+	flows[0]!.ev.onClose(new Error("gone"));
+	assert.equal(out.length, 1);
+	assert.equal(stack.udp.size, 0);
+
+	stack.send(udp(5001, ip4("93.184.215.14"), 6969, te.encode("x")));
+	assert.equal(stack.stats.udpOpened, 3);
+	stack.close();
+	assert.equal(flows[2]!.closed, true);
+	assert.equal(stack.udp.size, 0);
+});
+
+test("UDP flows: the least recently used is dropped at the limit", () => {
+	const closed: number[] = [];
+	const { stack } = mkStack({ udp: ({ port }) => ({ send() {}, close() { closed.push(port); } }) });
+	for (let p = 1001; p <= 1256; p++) stack.send(udp(5000, ip4("93.184.215.14"), p, new Uint8Array(1)));
+	stack.send(udp(5000, ip4("93.184.215.14"), 1001, new Uint8Array(1))); // the oldest is fresh again
+	stack.send(udp(5000, ip4("93.184.215.14"), 1257, new Uint8Array(1)));
+	assert.deepEqual(closed, [1002]);
+	assert.equal(stack.udp.size, 256);
+	stack.close();
+});
+
+test("Wisp backend: UDP streams carry datagrams without credit; a refused one closes", async () => {
+	await withWisp(async (b, seen) => {
+		const { stack, out } = mkStack(b);
+		const [ip] = await b.lookup("echo.test");
+		const te = new TextEncoder();
+		// More datagrams than the server's TCP credit of 2, the first ones before the WebSocket is up.
+		for (const s of ["a", "b", "c", "d"]) stack.send(udp(5000, ip4(ip!), 6969, te.encode(s)));
+		await until(() => out.length === 4);
+		assert.deepEqual(out.map((o) => new TextDecoder().decode(o.payload)), ["a", "b", "c", "d"]);
+		assert.deepEqual(out.map((o) => [ip4str(o.src!), o.sport, o.dport]), Array(4).fill([ip, 6969, 5000]));
+		assert.deepEqual(seen.hosts, ["udp:echo.test:6969"]);
+		out.splice(0);
+
+		stack.send(udp(5000, ip4("93.184.215.14"), 53, te.encode("q")));
+		await until(() => out.length === 1);
+		assert.equal(out[0]!.icmpType, 3);
+		assert.deepEqual(seen.hosts, ["udp:echo.test:6969", "udp:93.184.215.14:53"]);
+		stack.close();
+	});
+});
+
+test("direct backend: UDP reaches a host socket and back", async () => {
+	const { createSocket } = await import("node:dgram");
+	const srv = createSocket("udp4");
+	srv.on("message", (m, r) => srv.send(Buffer.concat([Buffer.from("re:"), m]), r.port, r.address));
+	await new Promise<void>((r) => srv.bind(0, "127.0.0.1", r));
+	const b = directBackend();
+	const { stack, out } = mkStack(b);
+	stack.send(udp(5000, ip4("10.0.2.2"), srv.address().port, new TextEncoder().encode("ping")));
+	await until(() => out.length === 1);
+	assert.equal(new TextDecoder().decode(out[0]!.payload), "re:ping");
+	assert.deepEqual([ip4str(out[0]!.src!), out[0]!.sport, out[0]!.dport], ["10.0.2.2", srv.address().port, 5000]);
+	b.close!();
+	srv.close();
+});
+
 test("no Wisp server: TCP is reset", async () => {
 	const b = wispBackend("ws://127.0.0.1:1/");
 	const { stack, out } = mkStack(b);

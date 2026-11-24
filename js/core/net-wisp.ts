@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // NetStack backend for Wisp v1 servers (https://github.com/MercuryWorkshop/wisp-protocol):
-// the guest's TCP connections, multiplexed over one WebSocket. Works
+// the guest's TCP connections and UDP flows, multiplexed over one WebSocket. Works
 // wherever there is a global WebSocket (browsers, Node >= 22).
 //
 // Packets: [type u8][stream id u32 LE][payload], all integers little-endian.
-//   0x01 CONNECT  type u8 (1 = TCP), port u16, hostname   client -> server
+//   0x01 CONNECT  type u8 (1 = TCP, 2 = UDP), port u16, hostname   client -> server
 //   0x02 DATA     bytes                                   both
 //   0x03 CONTINUE buffer remaining u32 (packets)          server -> client
 //   0x04 CLOSE    reason u8                               both
@@ -21,8 +21,11 @@
 //     stays open until the server closes it).
 //   * Only the client -> server direction is flow-controlled; pause() is
 //     a no-op and NetStack buffers what the server sends.
+//   * A UDP flow is a stream of type 2 to one host and port: each DATA
+//     packet is one datagram, with no credit either way. A server without
+//     UDP closes the stream, which the guest sees as ICMP port unreachable.
 
-import type { NetBackend, NetConnection, NetConnectionEvents } from "./net.ts";
+import type { NetBackend, NetConnection, NetConnectionEvents, NetDatagramFlow } from "./net.ts";
 
 /**
  * The default Wisp server: the project's own. Public alternatives (run by
@@ -56,6 +59,7 @@ export interface WispBackend extends NetBackend {
 const RETRY_MS = 5000;
 const HANDSHAKE_TIMEOUT_MS = 10000;
 const MAX_PACKET = 64 * 1024;          // coalesce guest segments up to this size
+const UDP_QUEUE = 32;                  // datagrams kept while the WebSocket connects
 const FAKE_BASE = (198 << 24 | 18 << 16) >>> 0, FAKE_SIZE = 1 << 17;
 const enc = new TextEncoder();
 
@@ -77,7 +81,7 @@ const ip4 = (s: string) => s.split(".").reduce((a, b) => ((a << 8) | Number(b)) 
 const isIPv4 = (s: string) => /^\d{1,3}(\.\d{1,3}){3}$/.test(s);
 
 interface Stream {
-	ev: NetConnectionEvents;
+	ev: Pick<NetConnectionEvents, "onData">;
 	credit: number;
 	out: Uint8Array[];
 	outBytes: number;
@@ -240,6 +244,47 @@ export function wispBackend(url: string | readonly string[], opts: WispBackendOp
 				pause() {},
 				resume() {},
 				get buffered() { return st.outBytes; },
+			};
+		},
+		udp({ host, port }, ev): NetDatagramFlow {
+			const id = nextId++;
+			const name = isIPv4(host) ? ipToName.get(ip4(host)) ?? host : host;
+			let queue: Uint8Array[] | null = [];
+			const st: Stream = {
+				ev: { onData: (d) => ev.onMessage(d) },
+				credit: 0, out: [], outBytes: 0, done: false, scheduled: false, open: false,
+				closed(err) {
+					if (st.done) return;
+					st.done = true;
+					streams.delete(id);
+					ev.onClose(err);
+				},
+				pump() {},
+			};
+			streams.set(id, st);
+			connectWs().then((s) => {
+				if (st.done) return;
+				const req = new Uint8Array(3 + enc.encode(name).length);
+				req[0] = 0x02;
+				new DataView(req.buffer).setUint16(1, port, true);
+				req.set(enc.encode(name), 3);
+				s.send(packet(0x01, id, req));
+				st.open = true;
+				for (const d of queue!) s.send(packet(0x02, id, d));
+				queue = null;
+			}, (e) => queueMicrotask(() => st.closed(e)));
+			return {
+				send(u8) {
+					if (st.done) return;
+					if (st.open) ws?.send(packet(0x02, id, u8));
+					else if (queue!.length < UDP_QUEUE) queue!.push(u8);
+				},
+				close() {
+					if (st.done) return;
+					st.done = true;
+					streams.delete(id);
+					if (st.open) ws?.send(packet(0x04, id, Uint8Array.of(0x02)));
+				},
 			};
 		},
 		lookup(name) {

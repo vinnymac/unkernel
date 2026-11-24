@@ -174,6 +174,18 @@ Browsers can't open raw TCP sockets, so the page reaches the internet
 through a Wisp proxy. The default one accepts only known origins, so if you
 host the page somewhere else, point `?wisp=` at your own proxy.
 
+Stock BitTorrent clients work over it, outbound only: peers over TCP,
+HTTP(S) trackers, and UDP trackers and DHT where the proxy allows UDP.
+In Alpine, `aria2c` installs itself on first use:
+
+```sh
+aria2c --seed-time=0 --bt-enable-lpd=false --disable-ipv6=true -d ~/Downloads \
+  https://torrent.ubuntu.com/ubuntu-mini-iso/releases/noble/release/mini-iso/ubuntu-mini-iso-24.04.5-mini-iso-amd64.iso.torrent
+```
+
+The proxy sees every peer address, so use one you run or are allowed to
+use this way.
+
 | Browser | Status |
 | --- | --- |
 | Chrome / Edge 137+ (desktop and Android) | ✅ works |
@@ -285,7 +297,9 @@ well behind native.
 - The SDK and CLI boot one CPU by default; the page boots several where
   it can (`?cpus=`). A snapshot of several CPUs (SMP), and so a session
   suspended on the page, resumes only on as many.
-- No IPv6, no UDP beyond DHCP and DNS, no inbound network connections
+- No IPv6, no inbound network connections, and UDP (beyond DHCP and DNS)
+  only where the backend relays it: host sockets do, a Wisp proxy does if
+  it allows UDP streams
   ([`vm.connect()`, `vm.fetch()`](#talk-over-vsock) and `--forward` reach
   guest servers over vsock instead).
 - No hardware breakpoints or watchpoints: `gdb`'s watchpoints are
@@ -347,7 +361,7 @@ await createKernel({ net: wispBackend(DEFAULT_WISP_SERVERS) });     // anywhere:
 
 Networking is off unless you pass `net`. Any object with `connect` and
 `lookup` methods can carry the guest's TCP and DNS, so you can write your
-own backend.
+own backend; with a `udp` method it carries the guest's UDP too.
 
 ### Add disks
 

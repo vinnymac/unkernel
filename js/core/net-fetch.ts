@@ -273,6 +273,12 @@ export function fetchRoutes(inner: NetBackend | undefined, routes: Record<string
 			if (r) return addr.port === 80 ? serve(r.name, r.route, ev) : refused(ev, `connection refused (${r.name} serves port 80 only)`);
 			return inner ? inner.connect(addr, ev) : refused(ev, "connection refused");
 		},
+		...(inner?.udp ? {
+			udp(addr, ev) {
+				if (byIp.has(addr.host)) throw new Error("no UDP on a routed address");
+				return inner.udp!(addr, ev);
+			},
+		} satisfies Pick<NetBackend, "udp"> : {}),
 		close() {
 			for (const abort of [...conns]) abort();
 			inner?.close?.();

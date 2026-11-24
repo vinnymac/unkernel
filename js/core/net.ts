@@ -8,7 +8,8 @@
 // DHCP server and DNS server, answers pings to the gateway, and terminates
 // TCP connections, bridging each one to a pluggable backend (NetBackend:
 // real sockets in Node, node/net.ts; a Wisp server, net-wisp.ts; or any
-// other transport).
+// other transport). UDP to other hosts is relayed by a backend that has
+// udp(): one flow per (guest port, remote address, remote port).
 //
 //   10.0.2.0/24   virtual subnet
 //   10.0.2.2      gateway (TCP to it goes to the host's loopback if the
@@ -16,8 +17,8 @@
 //   10.0.2.3      DNS server (A queries resolved by the backend)
 //   10.0.2.15     the guest (handed out by DHCP)
 //
-// Not implemented: IPv6, IP fragments, UDP other than DHCP/DNS (answered with
-// ICMP port unreachable), ICMP other than echo to the gateway/DNS address,
+// Not implemented: IPv6, IP fragments, UDP other than DHCP/DNS with a
+// backend that has no udp() (answered with ICMP port unreachable), ICMP other than echo to the gateway/DNS address,
 // TCP options beyond MSS and window scale (no SACK, no timestamps).
 
 import type { Kernel, NetDevice } from "./kernel.ts";
@@ -49,17 +50,35 @@ export interface NetConnection {
 	readonly buffered: number;
 }
 
+/** Events a backend reports for one UDP flow. */
+export interface NetDatagramEvents {
+	/** A datagram from the flow's remote address. */
+	onMessage(data: Uint8Array): void;
+	/** Called once, last, unless the stack closed the flow; null for a clean close. */
+	onClose(error: Error | null): void;
+}
+
+/** The host side of one UDP flow: the guest's datagrams to one remote address and port. */
+export interface NetDatagramFlow {
+	send(data: Uint8Array): void;
+	/** Drop the flow; no events follow. */
+	close(): void;
+}
+
 /**
- * Transport for the guest's TCP connections and DNS lookups.
+ * Transport for the guest's TCP connections, DNS lookups and UDP datagrams.
  *
  *   connect({ host, port }, events) -> NetConnection
  *   lookup(name) -> IPv4 dotted quads; reject with { code: "ENOTFOUND" }
  *     for NXDOMAIN, anything else becomes SERVFAIL
+ *   udp({ host, port }, events) (optional) -> NetDatagramFlow; without it
+ *     the guest's UDP (other than DHCP and DNS) gets ICMP port unreachable
  *   close() (optional) drops every connection and the transport
  */
 export interface NetBackend {
 	connect(addr: { host: string; port: number }, ev: NetConnectionEvents): NetConnection;
 	lookup(name: string): Promise<string[]>;
+	udp?(addr: { host: string; port: number }, ev: NetDatagramEvents): NetDatagramFlow;
 	close?(): void;
 }
 
@@ -79,11 +98,33 @@ export interface NetStats {
 	tx: number;
 	tcpOpened: number;
 	dns: number;
+	/** UDP flows opened on the backend. */
+	udpOpened: number;
 }
+
+/** One relayed UDP flow (NetStack.udp). */
+interface UdpFlow {
+	flow: NetDatagramFlow;
+	/** performance.now() of the last datagram either way. */
+	last: number;
+	/** The remote has answered. */
+	replied: boolean;
+	/** The guest's last frame up to the UDP header, for an ICMP error. */
+	quote: Uint8Array;
+	l4: number;
+}
+
+/** A UDP flow is dropped after this long without a datagram (shorter while the remote has never answered). */
+const UDP_IDLE_MS = 60000, UDP_UNANSWERED_MS = 15000;
+/** With more flows than this (a DHT client talks to hundreds of nodes), the least recently used go first. */
+const UDP_MAX_FLOWS = 256;
 
 const ETH_ARP = 0x0806, ETH_IP = 0x0800;
 const PROTO_ICMP = 1, PROTO_TCP = 6, PROTO_UDP = 17;
 const FIN = 1, SYN = 2, RST = 4, PSH = 8, ACK = 16;
+
+/** A timer that does not keep a Node process alive. */
+const unref = <T>(t: T): T => { (t as { unref?: () => void }).unref?.(); return t; };
 
 export const ip4 = (s: string): number => s.split(".").reduce((a, b) => ((a << 8) | Number(b)) >>> 0, 0);
 export const ip4str = (n: number): string => `${n >>> 24}.${(n >>> 16) & 255}.${(n >>> 8) & 255}.${n & 255}`;
@@ -451,6 +492,9 @@ export class NetStack implements NetDevice {
 	dns: number;
 	guest: number;
 	tcp: Map<string, TcpConn>;
+	/** Relayed UDP flows by "sport/dst/dport", least recently used first. */
+	udp: Map<string, UdpFlow>;
+	udpTimer: ReturnType<typeof setInterval> | undefined;
 	ipId: number;
 	/** Where frames for the guest go (set by attach()). */
 	output: (frame: Uint8Array) => void;
@@ -470,9 +514,11 @@ export class NetStack implements NetDevice {
 		this.dns = ip4("10.0.2.3");
 		this.guest = ip4("10.0.2.15");
 		this.tcp = new Map();
+		this.udp = new Map();
+		this.udpTimer = undefined;
 		this.ipId = 1;
 		this.output = () => {};
-		this.stats = { rx: 0, tx: 0, tcpOpened: 0, dns: 0 };
+		this.stats = { rx: 0, tx: 0, tcpOpened: 0, dns: 0, udpOpened: 0 };
 	}
 
 	/** Hook up to a Kernel (core/kernel.ts); called when the guest's driver initialises. */
@@ -490,9 +536,10 @@ export class NetStack implements NetDevice {
 		}
 	}
 
-	/** Reset every TCP connection (the backend stays usable). */
+	/** Reset every TCP connection and drop every UDP flow (the backend stays usable). */
 	close(): void {
 		for (const c of [...this.tcp.values()]) c.close();
+		for (const key of [...this.udp.keys()]) this.udpDrop(key);
 	}
 
 	emit(frame: Uint8Array): void {
@@ -616,7 +663,7 @@ export class NetStack implements NetDevice {
 		this.emit(r);
 	}
 
-	// --- UDP: DHCP and DNS -------------------------------------------------------
+	// --- UDP: DHCP, DNS and flows relayed by the backend ---------------------------
 
 	udpInput(f: Uint8Array, dv: DataView, src: number, dst: number, l4: number, end: number): void {
 		if (end - l4 < 8) return;
@@ -628,7 +675,62 @@ export class NetStack implements NetDevice {
 			return;
 		}
 		if (dst === 0xffffffff || dst >>> 28 === 14) return;
-		this.icmpUnreachable(f, l4, src, dst, 3);
+		const host = this.backend.udp ? this.backendHost(dst) : null;
+		if (host === null || dport === 0) return this.icmpUnreachable(f, l4, src, dst, 3);
+		const key = `${sport}/${dst}/${dport}`;
+		let u = this.udp.get(key);
+		if (u) this.udp.delete(key); // back in below, as the most recently used
+		else {
+			let flow: NetDatagramFlow;
+			const me: { u?: UdpFlow } = {};
+			const mine = () => me.u !== undefined && this.udp.get(key) === me.u;
+			try {
+				flow = this.backend.udp!({ host, port: dport }, {
+					onMessage: (data) => {
+						// No IP fragments: a datagram larger than the guest's MTU is dropped.
+						if (!mine() || data.length > (this.mtu ?? 1500) - 28) return;
+						me.u!.replied = true;
+						me.u!.last = performance.now();
+						this.sendUdp(dst, dport, src, sport, data);
+					},
+					onClose: (err) => {
+						if (!mine()) return;
+						const { quote, l4, replied } = me.u!;
+						this.udp.delete(key);
+						// A flow the backend refused (no UDP on this server, a blocked or dead port).
+						if (err && !replied) {
+							this.log?.(`[net] udp ${ip4str(dst)}:${dport}: ${err.message}`);
+							this.icmpUnreachable(quote, l4, src, dst, 3);
+						}
+					},
+				});
+			} catch (e) {
+				this.log?.(`[net] udp ${ip4str(dst)}:${dport}: ${errorText(e)}`);
+				return this.icmpUnreachable(f, l4, src, dst, 3);
+			}
+			u = me.u = { flow, last: 0, replied: false, quote: f, l4 };
+			this.stats.udpOpened++;
+			if (this.udp.size >= UDP_MAX_FLOWS) this.udpDrop(this.udp.keys().next().value!);
+			this.udpTimer ??= unref(setInterval(() => this.udpSweep(), 5000));
+		}
+		u.last = performance.now();
+		u.quote = f.slice(0, l4 + 8);
+		u.l4 = l4;
+		this.udp.set(key, u);
+		u.flow.send(payload.slice());
+	}
+
+	udpDrop(key: string): void {
+		const u = this.udp.get(key);
+		if (!u) return;
+		this.udp.delete(key);
+		try { u.flow.close(); } catch { /* the transport is gone */ }
+	}
+
+	udpSweep(): void {
+		const now = performance.now();
+		for (const [key, u] of this.udp) if (now - u.last > (u.replied ? UDP_IDLE_MS : UDP_UNANSWERED_MS)) this.udpDrop(key);
+		if (this.udp.size === 0) { clearInterval(this.udpTimer); this.udpTimer = undefined; }
 	}
 
 	dhcp(p: Uint8Array): void {

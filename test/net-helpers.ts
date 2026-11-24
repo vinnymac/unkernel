@@ -170,7 +170,8 @@ export async function echoTest(backend: NetBackend): Promise<void> {
 /**
  * A minimal Wisp v1 server: CONNECT to "echo.test" echoes DATA and closes
  * (reason 0x02) after "bye"; any other host is refused (0x44). The credit is
- * tiny, so the client has to wait for CONTINUE.
+ * tiny, so the client has to wait for CONTINUE. A UDP stream (seen as
+ * "udp:host:port") echoes each datagram and never sends CONTINUE.
  */
 export async function withWisp(fn: (b: WispBackend, seen: { hosts: string[]; packets: number }, url: string) => Promise<void>): Promise<void> {
 	const CREDIT = 2;
@@ -182,17 +183,19 @@ export async function withWisp(fn: (b: WispBackend, seen: { hosts: string[]; pac
 			b[0] = type; b.writeUInt32LE(id, 1); b.set(payload, 5);
 			return b;
 		};
+		const udpStreams = new Set<number>();
 		const ws: TestWebSocket = acceptWebSocket(req, socket, head, (m) => {
 			const id = m.readUInt32LE(1);
 			if (m[0] === 0x01) {
 				const host = m.subarray(8).toString();
-				seen.hosts.push(`${host}:${m.readUInt16LE(6)}`);
+				if (m[5] === 2) udpStreams.add(id);
+				seen.hosts.push(`${m[5] === 2 ? "udp:" : ""}${host}:${m.readUInt16LE(6)}`);
 				if (host !== "echo.test") ws.send(pkt(0x04, id, [0x44]));
 			} else if (m[0] === 0x02) {
 				seen.packets++;
 				const data = m.subarray(5);
 				ws.send(pkt(0x02, id, data));
-				ws.send(pkt(0x03, id, [CREDIT, 0, 0, 0]));
+				if (!udpStreams.has(id)) ws.send(pkt(0x03, id, [CREDIT, 0, 0, 0]));
 				if (data.toString().endsWith("bye")) ws.send(pkt(0x04, id, [0x02]));
 			}
 		}, () => {});

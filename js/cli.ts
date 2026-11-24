@@ -108,7 +108,7 @@ one (custom section unkernel.datadisk), else vendor/build/disk/kwdata.kwsparse.g
 Networking (a user-mode NAT over host sockets) is on by default: --no-net
 disables it, --net-mtu N sets the MTU handed out by DHCP. The guest is
 10.0.2.15, gateway 10.0.2.2 (= host 127.0.0.1), DNS 10.0.2.3. --net-wisp URL
-sends the guest's TCP through a Wisp server instead (handshake with
+sends the guest's TCP and UDP through a Wisp server instead (handshake with
 Origin: http://localhost, which wss://wisp.pi0.io:6680/ requires).
 
 kwemu's JIT tier (hot guest code compiled to WebAssembly) is offered by default;

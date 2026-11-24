@@ -1612,6 +1612,19 @@ parts that are easy to get wrong.
   addresses, and TCP (MSS, window scaling, flow control, go-back-N
   retransmit, FIN, RST). Each TCP connection goes to a backend (any object
   with `connect` and `lookup`). `net` may also be a spec (Worker mode).
+- UDP to other hosts goes to the backend's optional `udp(addr, events)`,
+  one flow per (guest port, remote address, remote port): dropped after
+  60 s idle (15 s if the remote never answered), at most 256 (least
+  recently used first). Without `udp()`, or when the backend closes a flow
+  that never answered with an error, the guest gets ICMP port unreachable.
+  `directBackend()` uses a connected socket per flow; `wispBackend()` a
+  UDP stream (type 2, one DATA packet per datagram, no credit), so a Wisp
+  server without UDP shows up as port unreachable.
+- BitTorrent works with stock clients (checked 2026-11-24 with aria2 1.37
+  and transmission-cli 4.1 in Alpine against a local swarm, through
+  `directBackend()` and a local wisp-js server): TCP peers, HTTP and UDP
+  trackers, DHT and magnet links, outbound only. aria2 sends UDP tracker
+  announces on its DHT socket, so `--enable-dht=false` turns them off too.
 - `directBackend()` (Node only, the CLI's default) uses host sockets and
   `dns.lookup`. With `hostLoopback`, 10.0.2.2 goes to the host's 127.0.0.1.
 - `wispBackend()` multiplexes connections over one WebSocket to a Wisp v1
@@ -1641,7 +1654,7 @@ parts that are easy to get wrong.
   takes the string form as `routes` (`buildNet()`). The page routes
   `deb.debian.org` to a CORS mirror (`web/src/config.ts` DEFAULT_ROUTES,
   `?routes=0` turns it off).
-- Not implemented: IPv6, IP fragments, UDP beyond DHCP and DNS, ICMP beyond
+- Not implemented: IPv6, IP fragments, ICMP beyond
   10.0.2.2/3, SACK, timestamps and inbound connections. A raw-Ethernet
   relay backend is not useful: v86's relay gave DHCP but no upstream DNS
   or TCP.
