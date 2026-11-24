@@ -14,6 +14,12 @@
 # Loopback is reachable only through Wisp, so only with the URL password; the
 # client key and the resolver to use are served to such a client on
 # 127.0.0.1:2223 (server.mjs).
+#
+# With PAGE_REPO (a git URL; PAGE_REF is its branch) it also builds that
+# checkout's unkernel page, on a release kernel, and serves it at / next to
+# the proxy: https://APP.fly.dev/?wisp=wss://APP.fly.dev/PASSWORD/. The build
+# runs in the background after every start (a few minutes, about 1 GiB of
+# memory); /health says building, up COMMIT or failed.
 cd /app || exit 1
 [ -d node_modules/@mercuryworkshop/wisp-js ] || npm i --no-audit --no-fund @mercuryworkshop/wisp-js@0.5.3 || exit 1
 
@@ -111,7 +117,25 @@ tunnel_up() {
 	/usr/sbin/sshd -f $d/sshd_config -E /tmp/tunnel-sshd.log || return 1
 }
 
+# Runs before the VPN is up: the build's downloads are not the guest's traffic.
+page_build() {
+	echo building > /tmp/page-state
+	apk add --no-cache git >/dev/null 2>&1 &&
+	rm -rf /srv/page && git clone -q --depth 1 -b "${PAGE_REF:-main}" "$PAGE_REPO" /srv/page &&
+	cd /srv/page && corepack enable pnpm >/dev/null 2>&1 &&
+	timeout 900 pnpm install --frozen-lockfile >/tmp/page-build.log 2>&1 &&
+	cd web && KW_LOCAL=0 CI=1 timeout 900 node node_modules/vite/bin/vite.js build >>/tmp/page-build.log 2>&1 || { echo failed > /tmp/page-state; return 1; }
+	echo "built $(git rev-parse --short HEAD)" > /tmp/page-state
+}
+page_serve() {
+	cd /srv/page/web && c=$(git rev-parse --short HEAD) || return 1
+	( PORT=${PAGE_PORT:-3000} NITRO_HOST=127.0.0.1 HOST=127.0.0.1 node .output/server/index.mjs >/tmp/page-server.log 2>&1 & )
+	echo "up $c" > /tmp/page-state
+}
+
+rm -f /tmp/page-state
 : > $R
+[ -z "$PAGE_REPO" ] || page_build || echo "page: build failed"
 if [ -n "$WG_CONF" ]; then
 	umask 077
 	printf '%s\n' "$WG_CONF" | tr -d '\r' > /tmp/wg-full.conf
@@ -129,4 +153,6 @@ fi
 if [ "$WISP_VPN" != failed ]; then
 	if tunnel_up; then export WISP_TUNNEL=up; else export WISP_TUNNEL=failed; echo "tunnel endpoint: setup failed"; fi
 fi
+case "$(cat /tmp/page-state 2>/dev/null)" in built*) page_serve || echo failed > /tmp/page-state ;; esac
+cd /app
 exec node server.mjs

@@ -5,6 +5,8 @@
 // https://HOST/PASSWORD/status says whether the VPN is up, what start.sh found in its
 // config (shape only) and which address the internet sees. The password is the secret
 // WISP_PASS, else WISP_PATH. /health, open to all, says only that the server runs.
+// Every other URL goes to the unkernel page that start.sh builds from PAGE_REPO
+// (its Nitro server on 127.0.0.1:PAGE_PORT), so the page and its proxy share an origin.
 import http from "node:http";
 import https from "node:https";
 import { execFileSync } from "node:child_process";
@@ -45,6 +47,20 @@ const tunnel = () => {
 		return { handshake: hs ? `${Math.round(Date.now() / 1000 - hs)} s ago` : "never", received: Number(rx), sent: Number(tx) };
 	} catch { return null; }
 };
+/** The page's server, once start.sh has built it (it writes /tmp/page-state: building, up COMMIT, failed). */
+const PAGE_PORT = Number(process.env.PAGE_PORT ?? 3000);
+const pageState = () => { try { return readFileSync("/tmp/page-state", "utf8").trim(); } catch { return "off"; } };
+const toPage = (q, r) => {
+	const state = pageState();
+	if (!state.startsWith("up")) {
+		r.writeHead(state === "off" ? 404 : 503, { "Content-Type": "text/plain", "Retry-After": "20" });
+		r.end(state === "off" ? "" : state === "failed" ? "The page failed to build; see /health.\n" : "The page is still building (a few minutes after a restart). Reload shortly.\n");
+		return;
+	}
+	const up = http.request({ host: "127.0.0.1", port: PAGE_PORT, method: q.method, path: q.url, headers: q.headers }, (u) => { r.writeHead(u.statusCode, u.headers); u.pipe(r); });
+	up.on("error", () => { if (!r.headersSent) r.writeHead(502); r.end(); });
+	q.pipe(up);
+};
 /** Counts for /health: enough to see why a page cannot connect, nothing about who or where to. */
 const seen = { accepted: 0, wrongPassword: 0, refusedVpnDown: 0, lastAccepted: null, lastRejected: null, origins: {}, rejectedBecause: {} };
 /** The guest tunnel endpoint (start.sh): whether a guest is attached and how much it has carried. */
@@ -65,10 +81,10 @@ const s = http.createServer(async (q, r) => {
 	if (q.url === "/health") {
 		r.writeHead(200, { "Content-Type": "application/json" });
 		r.end(JSON.stringify({ ok: true, auth: pass.length < 12 ? "none: refusing everything" : process.env.WISP_PASS ? "WISP_PASS" : "WISP_PATH", vpn,
-			handshake: vpn === "off" ? null : tunnel()?.handshake ?? null, guestTunnel: guestTunnel(), wisp: seen }) + "\n");
+			handshake: vpn === "off" ? null : tunnel()?.handshake ?? null, guestTunnel: guestTunnel(), page: pageState(), wisp: seen }) + "\n");
 		return;
 	}
-	if (authed(q.url) !== "status") { r.writeHead(404); r.end(); return; }
+	if (authed(q.url) !== "status") { toPage(q, r); return; }
 	let report = [];
 	try { report = readFileSync("/tmp/vpn-report.txt", "utf8").trim().split("\n").filter(Boolean); } catch { /* none */ }
 	r.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
