@@ -10,10 +10,10 @@
 #
 # In the Browser window, use its "open in a new tab" link; there, Get reads a
 # file out of the guest and Save keeps it (on an iPhone through the share
-# sheet: Save to Files). The file comes straight from the guest's disk,
-# nothing leaves the device, and it is in the page's memory once, so a file
-# of several GiB does not fit a phone. Run it again after new files arrive:
-# the list is made once.
+# sheet: Save to Files). The file comes straight from the guest's disk and
+# nothing leaves the device; it needs free storage for one more copy while
+# it is handed over. Run it again after new files arrive: the list is made
+# once.
 set -eu
 
 dir=${1:-$HOME/Downloads}
@@ -25,8 +25,10 @@ sudo=
 # The list: every file under DIR. A browser's own download of a link does not
 # go through the page's relay to the guest (Safari saves the page server's
 # answer instead), so the list's script fetches a file itself, which does, and
-# then hands the bytes over: the share sheet where there is one (an iPhone's
-# "Save to Files"), else a download. The file is in the page's memory once.
+# then hands the file over: the share sheet where there is one (an iPhone's
+# "Save to Files"), else a download. While it is read the file goes to the
+# browser's private on-disk storage (OPFS), not to memory, and the copy of
+# an earlier file is deleted first.
 esc() { sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'; }
 url() { sed 's/%/%25/g; s/ /%20/g; s/#/%23/g; s/?/%3F/g; s/"/%22/g'; }
 idx=$dir/index.html
@@ -48,24 +50,78 @@ HTML
 	cat <<'HTML'
 </ul>
 <script>
+// Where a file's bytes go while it is read: the browser's private on-disk
+// storage (OPFS), so that a large file is never in memory (a phone kills a
+// page that holds some hundreds of MiB). Written through a worker's
+// synchronous handle, else through createWritable(); only without OPFS at
+// all is the file kept in memory.
+const WORKER = `
+let h, pos = 0;
+onmessage = async (e) => {
+	try {
+		const m = e.data;
+		if (m.op === "open") {
+			const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle("kw-share", { create: true });
+			h = await (await dir.getFileHandle(m.name, { create: true })).createSyncAccessHandle();
+			h.truncate(0);
+		} else if (m.op === "write") { pos += h.write(new Uint8Array(m.buf), { at: pos }); }
+		else if (m.op === "close") { h.flush(); h.close(); }
+		postMessage({ ok: true });
+	} catch (err) { postMessage({ ok: false, error: String(err && err.message || err) }); }
+};`;
+async function sink(name) {
+	const mode = new URLSearchParams(location.search).get("sink"); // for tests: memory, stream
+	try {
+		if (mode === "memory" || !navigator.storage || !navigator.storage.getDirectory) throw new Error("no OPFS");
+		const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle("kw-share", { create: true });
+		// One file at a time is kept: an earlier one has been saved or given up.
+		for await (const n of dir.keys()) await dir.removeEntry(n).catch(() => {});
+		const fh = await dir.getFileHandle(name, { create: true });
+		const writable = async () => {
+			const w = await fh.createWritable();
+			return { kind: "disk (stream)", write: (c) => w.write(c), close: async () => { await w.close(); return fh.getFile(); } };
+		};
+		if (mode === "stream") return await writable();
+		const wk = new Worker(URL.createObjectURL(new Blob([WORKER], { type: "text/javascript" })));
+		const call = (m, t) => new Promise((res, rej) => {
+			wk.onmessage = (e) => (e.data.ok ? res() : rej(new Error(e.data.error)));
+			wk.onerror = (e) => rej(new Error(e.message || "worker failed"));
+			wk.postMessage(m, t || []);
+		});
+		// The worker's handle is several times faster than the stream (measured in Chromium).
+		try { await call({ op: "open", name }); } catch (e) { wk.terminate(); if (fh.createWritable) return await writable(); throw e; }
+		return {
+			kind: "disk (worker)",
+			write: (c) => { const buf = c.buffer.slice(c.byteOffset, c.byteOffset + c.byteLength); return call({ op: "write", buf }, [buf]); },
+			close: async () => { await call({ op: "close" }); wk.terminate(); return fh.getFile(); },
+		};
+	} catch (e) {
+		const parts = [];
+		return { kind: "memory (" + e.message + ")", write: async (c) => { parts.push(c); }, close: async () => new File(parts, name) };
+	}
+}
 for (const li of document.querySelectorAll("li[data-href]")) {
 	const get = li.querySelector(".get"), st = li.querySelector(".st");
 	const name = li.querySelector("span").textContent.split("/").pop();
 	get.onclick = async () => {
 		get.disabled = true;
 		try {
+			const out = await sink(name);
 			const r = await fetch(li.dataset.href);
 			if (!r.ok) throw new Error("HTTP " + r.status);
-			const total = Number(r.headers.get("content-length")) || 0, parts = [];
-			let got = 0;
+			const total = Number(r.headers.get("content-length")) || 0;
+			if (out.kind.startsWith("memory") && total > 200 * 1048576 && !confirm("This browser cannot buffer the file on disk, and " + Math.round(total / 1048576) + " MiB may not fit in memory: the page may reload. Go on?")) throw new Error("not read");
+			let got = 0, shown = 0;
 			for (const rd = r.body.getReader();;) {
 				const { done, value } = await rd.read();
 				if (done) break;
-				parts.push(value); got += value.length;
-				st.textContent = (got / 1048576).toFixed(1) + " MiB" + (total ? " of " + (total / 1048576).toFixed(1) : "");
+				await out.write(value); got += value.length;
+				if (got - shown >= 1048576) { shown = got; st.textContent = (got / 1048576).toFixed(0) + " MiB" + (total ? " of " + (total / 1048576).toFixed(0) : ""); }
 			}
-			const file = new File(parts, name, { type: "application/octet-stream" });
-			li.kwFile = file;
+			const stored = await out.close();
+			if (stored.size !== got) throw new Error("stored " + stored.size + " of " + got + " bytes");
+			const file = new File([stored], name, { type: "application/octet-stream" }); // a reference, not a copy
+			li.kwFile = file; li.kwSink = out.kind;
 			st.textContent = (got / 1048576).toFixed(1) + " MiB ready";
 			get.remove();
 			const save = Object.assign(document.createElement("button"), { className: "save", textContent: "Save" });
