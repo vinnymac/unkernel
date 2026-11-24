@@ -12,6 +12,9 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { server as wisp } from "@mercuryworkshop/wisp-js/server";
 wisp.options.dns_result_order = "ipv4first";
+// start.sh's tunnel endpoint is on loopback, reached through Wisp as "kw-tunnel".
+const tunnelUp = process.env.WISP_TUNNEL === "up";
+wisp.options.allow_loopback_ips = tunnelUp;
 const pass = (process.env.WISP_PASS || process.env.WISP_PATH || "").trim();
 if (pass.length < 12) { console.error("WISP_PASS must be at least 12 characters"); }
 const digest = (t) => createHash("sha256").update(t).digest();
@@ -44,11 +47,25 @@ const tunnel = () => {
 };
 /** Counts for /health: enough to see why a page cannot connect, nothing about who or where to. */
 const seen = { accepted: 0, wrongPassword: 0, refusedVpnDown: 0, lastAccepted: null, lastRejected: null, origins: {}, rejectedBecause: {} };
+/** The guest tunnel endpoint (start.sh): whether a guest is attached and how much it has carried. */
+const guestTunnel = () => {
+	if (!tunnelUp) return process.env.WISP_TUNNEL ?? "off";
+	try {
+		const up = readFileSync("/sys/class/net/tun0/carrier", "utf8").trim() === "1";
+		return { attached: up, received: Number(readFileSync("/sys/class/net/tun0/statistics/rx_bytes", "utf8")), sent: Number(readFileSync("/sys/class/net/tun0/statistics/tx_bytes", "utf8")) };
+	} catch { return { attached: false }; }
+};
+// For a client that came through Wisp (so with the password): the tunnel's key and resolver.
+if (tunnelUp) http.createServer((q, r) => {
+	const f = q.url === "/key" ? "/app/tunnel/id" : q.url === "/dns" ? "/app/tunnel/dns" : null;
+	if (!f) { r.writeHead(404); r.end(); return; }
+	r.writeHead(200, { "Content-Type": "text/plain" }); r.end(readFileSync(f));
+}).listen(2223, "127.0.0.1");
 const s = http.createServer(async (q, r) => {
 	if (q.url === "/health") {
 		r.writeHead(200, { "Content-Type": "application/json" });
 		r.end(JSON.stringify({ ok: true, auth: pass.length < 12 ? "none: refusing everything" : process.env.WISP_PASS ? "WISP_PASS" : "WISP_PATH", vpn,
-			handshake: vpn === "off" ? null : tunnel()?.handshake ?? null, wisp: seen }) + "\n");
+			handshake: vpn === "off" ? null : tunnel()?.handshake ?? null, guestTunnel: guestTunnel(), wisp: seen }) + "\n");
 		return;
 	}
 	if (authed(q.url) !== "status") { r.writeHead(404); r.end(); return; }

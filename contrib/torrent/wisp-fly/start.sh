@@ -7,6 +7,13 @@
 # With a WG_CONF that does not work the server refuses Wisp connections rather
 # than fall back to Fly's address. /tmp/vpn-report.txt (shown by the status
 # page) describes the config's shape and what failed, never its values.
+#
+# It also runs an IP tunnel endpoint for a guest on a page that relays no UDP
+# (torrent.sh uses it): an sshd on 127.0.0.1:2222 that only forwards tun0
+# (10.77.0.1 here, 10.77.0.2 in the guest), NATed to the same exit as Wisp.
+# Loopback is reachable only through Wisp, so only with the URL password; the
+# client key and the resolver to use are served to such a client on
+# 127.0.0.1:2223 (server.mjs).
 cd /app || exit 1
 [ -d node_modules/@mercuryworkshop/wisp-js ] || npm i --no-audit --no-fund @mercuryworkshop/wisp-js@0.5.3 || exit 1
 
@@ -66,6 +73,44 @@ vpn_up() {
 	say "tunnel configured"
 }
 
+tunnel_up() {
+	apk add --no-cache openssh-server openssh-keygen iproute2 iptables >/dev/null 2>&1 || return 1
+	d=/app/tunnel; mkdir -p $d /var/empty; chmod 700 $d
+	[ -f $d/hostkey ] || ssh-keygen -q -t ed25519 -N "" -f $d/hostkey
+	[ -f $d/id ] || ssh-keygen -q -t ed25519 -N "" -f $d/id -C kw-tunnel
+	# Not "restrict": it also turns tunnel forwarding off.
+	printf 'no-pty,no-agent-forwarding,no-X11-forwarding,no-user-rc,tunnel="0" %s\n' "$(cat $d/id.pub)" > $d/authorized_keys
+	cat > $d/sshd_config <<-CONF
+		Port 2222
+		ListenAddress 127.0.0.1
+		HostKey $d/hostkey
+		PermitRootLogin prohibit-password
+		PasswordAuthentication no
+		KbdInteractiveAuthentication no
+		AuthorizedKeysFile $d/authorized_keys
+		StrictModes no
+		PermitTunnel point-to-point
+		AllowTcpForwarding no
+		X11Forwarding no
+		ForceCommand /sbin/nologin
+		PidFile $d/sshd.pid
+	CONF
+	grep -q kw-tunnel /etc/hosts || echo "127.0.0.1 kw-tunnel" >> /etc/hosts
+	ip tuntap add dev tun0 mode tun && ip addr add 10.77.0.1 peer 10.77.0.2 dev tun0 && ip link set tun0 mtu 1280 up || return 1
+	sysctl -q -w net.ipv4.ip_forward=1 || return 1
+	out=eth0; [ "$WISP_VPN" = up ] && out=wg0
+	# The guest gets the internet through the exit, and nothing of Fly's side.
+	iptables -t nat -A POSTROUTING -s 10.77.0.2 -o $out -j MASQUERADE &&
+	iptables -A FORWARD -i tun0 -d 172.16.0.0/12 -j REJECT &&
+	iptables -A FORWARD -i tun0 -o $out -j ACCEPT &&
+	iptables -A FORWARD -i $out -o tun0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+	iptables -A FORWARD -j REJECT || return 1
+	ip6tables -A FORWARD -j REJECT 2>/dev/null
+	dns=$( [ "$WISP_VPN" = up ] && val DNS | tr ' ' '\n' | grep -E '^[0-9.]+$' | head -1 )
+	echo "${dns:-1.1.1.1}" > $d/dns
+	/usr/sbin/sshd -f $d/sshd_config -E /tmp/tunnel-sshd.log || return 1
+}
+
 : > $R
 if [ -n "$WG_CONF" ]; then
 	umask 077
@@ -80,5 +125,8 @@ if [ -n "$WG_CONF" ]; then
 	umask 022
 	check
 	if vpn_up; then export WISP_VPN=up; else export WISP_VPN=failed; fi
+fi
+if [ "$WISP_VPN" != failed ]; then
+	if tunnel_up; then export WISP_TUNNEL=up; else export WISP_TUNNEL=failed; echo "tunnel endpoint: setup failed"; fi
 fi
 exec node server.mjs

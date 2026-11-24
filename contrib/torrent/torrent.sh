@@ -13,9 +13,11 @@
 # The guest reaches peers through the page's Wisp proxy (?wisp=wss://...), so
 # the address peers see is that proxy's, or its VPN's: the script prints it
 # first. Only outbound connections work. UDP trackers, DHT and trackerless
-# magnet links need a page and a proxy that relay UDP (this branch and
-# wisp-fly/ do); a page without the relay still downloads a torrent that has
-# an HTTP(S) tracker, from the peers that tracker names.
+# magnet links need UDP: a page that relays it (this branch), or else, on a
+# page that does not (a release without the relay), the IP tunnel that the
+# wisp-fly/ proxy offers: the script then sends all the guest's traffic
+# through an ssh tunnel (tun0) inside the Wisp connection. TORRENT_TUNNEL=0
+# never tunnels, =1 always does.
 #
 # The client is Transmission: it bootstraps DHT by itself and keeps a deep
 # request queue per peer, where aria2 keeps 6 blocks outstanding and so drops
@@ -47,8 +49,49 @@ if ! command -v transmission-cli >/dev/null 2>&1; then
 	fi
 fi
 
-# What the internet sees: the Wisp proxy's address, or its VPN's.
 fetch() { if command -v wget >/dev/null 2>&1; then wget -q -T 15 -O - "$1"; else curl -fsS -m 15 "$1"; fi; }
+
+# Does a UDP datagram to the internet get an answer (a DNS query to 1.1.1.1)?
+udp_works() {
+	command -v nslookup >/dev/null 2>&1 || return 1
+	nslookup -timeout=4 -retry=1 example.com 1.1.1.1 >/dev/null 2>&1
+}
+
+# The proxy's tunnel endpoint is its loopback, which it knows as kw-tunnel:
+# the page's DNS gives any name an address that the proxy maps back to it.
+tunnel() {
+	if ip link show tun0 >/dev/null 2>&1 && ping -c 1 -W 3 10.77.0.1 >/dev/null 2>&1; then return 0; fi
+	t=$(getent hosts kw-tunnel | awk '{print $1; exit}')
+	gw=$(ip route | awk '/^default/ {print $3; exit}')
+	[ -n "$t" ] && [ -n "$gw" ] || return 1
+	key=$(mktemp)
+	fetch "http://$t:2223/key" > "$key" 2>/dev/null && grep -q "PRIVATE KEY" "$key" || { rm -f "$key"; return 1; }
+	dns=$(fetch "http://$t:2223/dns" 2>/dev/null || echo 1.1.1.1)
+	if ! command -v ssh >/dev/null 2>&1; then
+		echo "torrent: installing an ssh client for the tunnel" >&2
+		if command -v apk >/dev/null 2>&1; then $sudo apk add openssh-client-default >&2
+		else $sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-client >&2; fi
+	fi
+	$sudo ip route add "$t/32" via "$gw" 2>/dev/null || true
+	$sudo ssh -f -N -w 0:0 -p 2222 -i "$key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+		-o ServerAliveInterval=15 -o ExitOnForwardFailure=yes -o LogLevel=ERROR "root@$t" || { rm -f "$key"; return 1; }
+	i=0; until ip link show tun0 >/dev/null 2>&1 || [ $i -ge 10 ]; do sleep 1; i=$((i+1)); done
+	$sudo ip addr add 10.77.0.2 peer 10.77.0.1 dev tun0 && $sudo ip link set tun0 mtu 1280 up || return 1
+	ping -c 1 -W 5 10.77.0.1 >/dev/null 2>&1 || return 1
+	# Everything but the tunnel's own connection now goes through it, names included.
+	$sudo ip route del default && $sudo ip route add default dev tun0 || return 1
+	echo "nameserver $dns" | $sudo tee /etc/resolv.conf >/dev/null
+}
+
+case ${TORRENT_TUNNEL:-auto} in
+0) ;;
+1) tunnel && echo "torrent: using the proxy's IP tunnel" >&2 || { echo "torrent: the tunnel did not come up" >&2; exit 1; } ;;
+*) if udp_works; then :
+	elif tunnel; then echo "torrent: this page relays no UDP: using the proxy's IP tunnel" >&2
+	else echo "torrent: no UDP here (no DHT, no UDP trackers): only peers from HTTP(S) trackers" >&2; fi ;;
+esac
+
+# What the internet sees: the Wisp proxy's address, or its VPN's.
 ip=$(fetch https://api.ipify.org 2>/dev/null || true)
 echo "torrent: peers will see ${ip:-an address I could not determine (no network?)}" >&2
 
