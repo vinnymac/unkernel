@@ -20,12 +20,13 @@ On a page that relays no UDP (a release without this branch's relay) the
 script reaches DHT and UDP trackers through an IP tunnel to the proxy below
 (ssh over the Wisp connection).
 
-`share.sh [DIR]` gets the files out: it serves `~/Downloads` in the guest with
-a list and opens it in the page's Browser window; opened in a new tab from
-there, Get reads a file out of the guest and Save keeps it on the device (an
-iPhone's share sheet: Save to Files). A browser's own download of a link would
-not reach the guest, so the list fetches the file itself; it is in the page's
-memory once.
+`share.sh [DIR]` gets the files out: it lists what is in `~/Downloads` in the
+guest, a row per file or folder, and opens the list in the page's Browser
+window. Opened in a new tab from there, Download saves an item to the device
+(an iPhone: Files > Downloads); a folder comes as one zip. The list reads the
+item through the page into the browser's on-disk storage and has the browser
+download that copy: a browser's own download of a link would not reach the
+guest, and a phone kills a page that holds a large file in memory.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/vinnymac/unkernel/claude/vigilant-johnson-6zatj5/contrib/torrent/share.sh | sh
