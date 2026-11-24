@@ -18,8 +18,9 @@ import runtimes from "./runtimes/index.ts";
 import servers from "./servers/index.ts";
 import system from "./system/index.ts";
 import tools from "./tools/index.ts";
+import torrents from "./torrents/index.ts";
 import type { App, Group } from "./types.ts";
 
-export const GROUPS: Group[] = [system, agents, tools, runtimes, servers, linux, browsers, desktop, games, media, gl];
+export const GROUPS: Group[] = [system, torrents, agents, tools, runtimes, servers, linux, browsers, desktop, games, media, gl];
 /** Every app, hidden ones too, in the groups' order. */
 export const APPS: App[] = GROUPS.flatMap((g) => g.apps);

@@ -75,6 +75,7 @@
 // but disabled, with why; so is one whose `packages` leave out this boot's
 // distro (?distro=).
 import { createElement } from "react";
+import { keepAwake } from "./awake.ts";
 import { isPageApp, type AppDef, type AppDownload, type AppFiles, type Distro, type TerminalApp } from "./apps/types.ts";
 import { Installer } from "./components/Installer.tsx";
 import { getFile, pushFile } from "./download.ts";
@@ -553,6 +554,7 @@ export async function launch(d: AppDef): Promise<void> {
 async function start(vm: KernelHandle, d: TerminalApp, dir: string): Promise<void> {
 	const ui = KW.ui!;
 	starting.add(d.id);
+	if (d.awake) keepAwake((m) => ui.hostLog(m));
 	const wayland = !!d.needs?.wayland;
 	try {
 		// sh -l, so run.sh gets the login environment (PATH, the apk hooks).

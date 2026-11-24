@@ -14,6 +14,16 @@
 // get <script src="/vm-ws.js"> right after their doctype: that shim's
 // WebSocket talks to the page over a BroadcastChannel (preview.ts).
 //
+// Downloads: a browser's own download may not come here (Safari's asks the
+// network), so the documents also get <script src="/vm-save.js">, which
+// saves an <a download> itself, and a navigation whose answer would be a
+// download (an attachment, or a type no browser shows) is answered with a
+// document that runs that script on the same URL (vm-save.js has the how).
+//
+// A preview document's link to a root-relative URL (/files/) leaves /vm/:
+// such a navigation, known by its referrer, is redirected to the same path
+// on that document's guest port.
+//
 // Stateless on purpose: browsers stop idle service workers, so every fetch
 // asks the open windows again. Each window that is not itself a preview
 // gets the request with a MessagePort of its own; the page that owns the
@@ -49,6 +59,10 @@ const DROP = new Set(["connection", "keep-alive", "transfer-encoding", "upgrade"
 const NULL_BODY = new Set([101, 103, 204, 205, 304]);
 /** The WebSocket shim (public/vm-ws.js): always from the network, never relayed. */
 const SHIM = "/vm-ws.js";
+/** The download helper (public/vm-save.js): always from the network too. */
+const SAVE = "/vm-save.js";
+/** Navigations answered with these types are shown by the browser; other application/ types and attachments are downloads. */
+const SHOWN = /^\s*(?:text\/|image\/|audio\/|video\/|font\/|multipart\/|application\/(?:json|pdf|xml|xhtml\+xml|javascript|ecmascript|wasm|manifest\+json|ld\+json|rss\+xml|atom\+xml|x-www-form-urlencoded)\b|application\/[a-z0-9.-]+\+(?:json|xml)\b)/i;
 /** How far into a document the doctype is looked for before the shim goes at the start. */
 const SNIFF_BYTES = 1024;
 
@@ -79,7 +93,12 @@ self.addEventListener("fetch", (event) => {
 	if (!m) {
 		// A preview document's root-relative request: to its guest port. Its
 		// clientId is that document (or a worker it started); a navigation has none.
-		if (!LEGACY && event.clientId && url.pathname !== SHIM && event.request.mode !== "navigate") event.respondWith(fromPreview(event, url));
+		if (!LEGACY && event.clientId && url.pathname !== SHIM && url.pathname !== SAVE && event.request.mode !== "navigate") event.respondWith(fromPreview(event, url));
+		// A preview document's root-relative link: back under its prefix.
+		else if (!LEGACY && event.request.mode === "navigate") {
+			const from = referrerPreview(event.request);
+			if (from) event.respondWith(Response.redirect(new URL(`/vm/${from[1]}/${from[2]}${url.pathname}${url.search}`, url).href, 307));
+		}
 		return; // otherwise not a preview URL: the network, as if there were no worker
 	}
 	// /vm/<id>/<port> without the slash: relative URLs in the page need it.
@@ -96,6 +115,15 @@ self.addEventListener("message", (event) => {
 	if (!port || d?.t !== "kw-check") return;
 	port.postMessage({ t: "kw-check", update: LEGACY, offline: false });
 });
+
+/** The preview document a navigation comes from (its referrer), as PREVIEW_RE's match, or null. */
+function referrerPreview(req) {
+	try {
+		const r = new URL(req.referrer);
+		const m = r.origin === location.origin ? PREVIEW_RE.exec(r.pathname) : null;
+		return m && m[3] !== undefined ? m : null;
+	} catch { return null; }
+}
 
 /** A request of a document this worker controls: relayed if that document is a preview, else from the network. */
 async function fromPreview(event, url) {
@@ -189,6 +217,13 @@ async function relay(event, vmId, port, path) {
 			}
 			headers.set("cross-origin-embedder-policy", COEP);
 			headers.set("cross-origin-resource-policy", "same-origin");
+			if (isDownload(req, d.status, headers)) {
+				// The saver document reads the same URL itself (vm-save.js); this body is not wanted.
+				owner.postMessage({ t: "cancel" });
+				settle(saver(path, headers));
+				end();
+				return;
+			}
 			let stream = null;
 			if (!NULL_BODY.has(d.status) && req.method !== "HEAD") {
 				stream = new ReadableStream({
@@ -222,10 +257,47 @@ function wantsShim(req, status, headers) {
 	return /^\s*text\/html\b/i.test(headers.get("content-type") ?? "");
 }
 
-/** The shim's tag, with the guest's CSP nonce if it has one (a nonce-only script-src blocks it otherwise). */
+/** The shims' tags, with the guest's CSP nonce if it has one (a nonce-only script-src blocks them otherwise). */
 function shimTag(vmId, port, headers) {
 	const nonce = /'nonce-([A-Za-z0-9+/_=-]+)'/.exec(headers.get("content-security-policy") ?? "")?.[1];
-	return `<script src="${SHIM}" data-kw-vm="${vmId}" data-kw-port="${port}"${nonce ? ` nonce="${nonce}"` : ""}></script>`;
+	const n = nonce ? ` nonce="${nonce}"` : "";
+	return `<script src="${SHIM}" data-kw-vm="${vmId}" data-kw-port="${port}"${n}></script><script src="${SAVE}"${n}></script>`;
+}
+
+/** A navigation whose answer the browser would download instead of showing. */
+function isDownload(req, status, headers) {
+	if (req.mode !== "navigate" || req.method !== "GET" || status !== 200) return false;
+	if (/^\s*attachment\b/i.test(headers.get("content-disposition") ?? "")) return true;
+	const type = headers.get("content-type");
+	return !!type && /^\s*application\//i.test(type) && !SHOWN.test(type);
+}
+
+/** The file name a download's headers give (RFC 6266), else its URL's last segment. */
+function downloadName(path, headers) {
+	const cd = headers.get("content-disposition") ?? "";
+	const star = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/.exec(cd)?.[1];
+	if (star) { try { return decodeURIComponent(star.trim()); } catch { /* the plain one */ } }
+	const plain = /filename\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;]+))/i.exec(cd);
+	if (plain) return (plain[1] !== undefined ? plain[1].replace(/\\(.)/g, "$1") : plain[2].trim()) || "download";
+	try { return decodeURIComponent(path.split("?")[0].split("/").filter(Boolean).pop() ?? "") || "download"; } catch { return "download"; }
+}
+
+/** The document that saves the URL it was asked for (vm-save.js). */
+function saver(path, headers) {
+	const esc = (v) => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+	const name = downloadName(path, headers).replace(/[/\\]/g, "_");
+	const html = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(name)}</title>
+<style>body{font:17px/1.5 system-ui,sans-serif;margin:2em 1.5em 6em;background:#000;color:#ededed}a{color:#4ad}</style>
+<h1 style="font-size:1.2em;overflow-wrap:anywhere">${esc(name)}</h1>
+<p>Reading this file out of the guest. It is then saved to this device like any download.</p>
+<p><a href="#" onclick="history.length > 1 ? history.back() : close(); return false">Back</a></p>
+<script src="${SAVE}" data-kw-save="1" data-kw-name="${esc(name)}" data-kw-size="${Number(headers.get("content-length")) || 0}"></script>`;
+	return new Response(html, {
+		headers: {
+			"content-type": "text/html; charset=utf-8", "cache-control": "no-store",
+			"cross-origin-embedder-policy": COEP, "cross-origin-resource-policy": "same-origin",
+		},
+	});
 }
 
 /**

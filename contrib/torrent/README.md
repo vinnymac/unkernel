@@ -1,5 +1,12 @@
 # Torrents in an unkernel guest
 
+On this branch's page the launcher has a Torrents folder (`web/src/apps/torrents/`):
+Add Torrent (asks for a URL or magnet link), Transmission (the daemon, its web
+interface in the Browser) and Downloads (`~/Downloads` in the Browser, served
+by dufs; a file or a folder as a zip is saved to the device). Both torrent
+apps hold the screen on. The scripts below do the same by hand, and on a page
+without these apps.
+
 `torrent.sh` downloads a torrent inside the guest (Alpine or Debian) with
 Transmission and stops when it is complete:
 

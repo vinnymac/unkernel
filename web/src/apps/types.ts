@@ -141,6 +141,8 @@ export interface TerminalApp extends AppBase {
 	commands: string[];
 	/** Ports the app serves http on: the preview opens on the first once it answers. */
 	ports?: number[];
+	/** Its work goes on unattended (a download): the page holds the screen on from its launch (awake.ts). */
+	awake?: boolean;
 	/**
 	 * The Wayland app ids (xdg_toplevel.set_app_id) its windows set, when
 	 * they are not its id (nor, reverse-DNS, end in it: org.gnome.Tali):
