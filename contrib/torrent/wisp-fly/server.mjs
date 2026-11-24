@@ -34,10 +34,13 @@ const tunnel = () => {
 		return { handshake: hs ? `${Math.round(Date.now() / 1000 - hs)} s ago` : "never", received: Number(rx), sent: Number(tx) };
 	} catch { return null; }
 };
+/** Counts for /health: enough to see why a page cannot connect, nothing about who or where to. */
+const seen = { accepted: 0, wrongPassword: 0, refusedVpnDown: 0, lastAccepted: null, lastRejected: null, origins: {} };
 const s = http.createServer(async (q, r) => {
 	if (q.url === "/health") {
 		r.writeHead(200, { "Content-Type": "application/json" });
-		r.end(JSON.stringify({ ok: true, auth: pass.length < 12 ? "none: refusing everything" : process.env.WISP_PASS ? "WISP_PASS" : "WISP_PATH", vpn }) + "\n");
+		r.end(JSON.stringify({ ok: true, auth: pass.length < 12 ? "none: refusing everything" : process.env.WISP_PASS ? "WISP_PASS" : "WISP_PATH", vpn,
+			handshake: vpn === "off" ? null : tunnel()?.handshake ?? null, wisp: seen }) + "\n");
 		return;
 	}
 	if (authed(q.url) !== "status") { r.writeHead(404); r.end(); return; }
@@ -47,5 +50,11 @@ const s = http.createServer(async (q, r) => {
 	r.end(JSON.stringify({ vpn, egress: await egress(), region: process.env.FLY_REGION, tunnel: vpn === "off" ? null : tunnel(), report }, null, 1) + "\n");
 });
 // A VPN that was asked for and is not up: no Wisp, rather than Fly's own address.
-s.on("upgrade", (q, sock, head) => { if (vpn !== "failed" && authed(q.url) !== null) wisp.routeRequest(q, sock, head); else sock.destroy(); });
+s.on("upgrade", (q, sock, head) => {
+	const now = new Date().toISOString(), origin = String(q.headers.origin ?? "none").slice(0, 80);
+	seen.origins[origin] = (seen.origins[origin] ?? 0) + 1;
+	if (authed(q.url) === null) { seen.wrongPassword++; seen.lastRejected = now; sock.destroy(); }
+	else if (vpn === "failed") { seen.refusedVpnDown++; seen.lastRejected = now; sock.destroy(); }
+	else { seen.accepted++; seen.lastAccepted = now; wisp.routeRequest(q, sock, head); }
+});
 s.listen(8080, "0.0.0.0", () => console.log("wisp listening, vpn " + vpn));
