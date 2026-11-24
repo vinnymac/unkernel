@@ -21,8 +21,11 @@ script reaches DHT and UDP trackers through an IP tunnel to the proxy below
 (ssh over the Wisp connection).
 
 `share.sh [DIR]` gets the files out: it serves `~/Downloads` in the guest with
-a page of download links and opens it in the page's Browser window; opened in
-a new tab from there, a tap saves a file to the device.
+a list and opens it in the page's Browser window; opened in a new tab from
+there, Get reads a file out of the guest and Save keeps it on the device (an
+iPhone's share sheet: Save to Files). A browser's own download of a link would
+not reach the guest, so the list fetches the file itself; it is in the page's
+memory once.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/vinnymac/unkernel/claude/vigilant-johnson-6zatj5/contrib/torrent/share.sh | sh
