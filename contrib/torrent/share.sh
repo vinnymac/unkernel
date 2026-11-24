@@ -9,8 +9,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/vinnymac/unkernel/claude/vigilant-johnson-6zatj5/contrib/torrent/share.sh | sh
 #
 # In the Browser window, use its "open in a new tab" link; there, Get reads a
-# file out of the guest and Save keeps it (on an iPhone through the share
-# sheet: Save to Files). The file comes straight from the guest's disk and
+# file out of the guest and Download keeps it (Share offers the share sheet,
+# for small files; a copy read before a reload is offered again as it is). The file comes straight from the guest's disk and
 # nothing leaves the device; it needs free storage for one more copy while
 # it is handed over. Run it again after new files arrive: the list is made
 # once.
@@ -40,12 +40,14 @@ idx=$dir/index.html
 button{font:inherit;padding:.5em 1em;margin:.3em .3em 0 0;border-radius:.5em;border:1px solid #888;background:#eee}
 button.save{background:#0a7;color:#fff;border-color:#0a7}</style>
 <h1>Files from the guest</h1>
-<p>Tap <b>Get</b> to read a file out of the guest, then <b>Save</b> to keep it on this device.</p><ul>
+<p>Tap <b>Get</b> to read a file out of the guest, then <b>Download</b> to keep it on this device.
+<b>Share</b> offers the system's share sheet instead; it suits small files (a phone may run out of
+memory sharing a large one).</p><ul>
 HTML
 	(cd "$dir" && find . -type f ! -name index.html ! -name '*.part' | sed 's|^\./||' | sort) | while IFS= read -r f; do
 		size=$(du -h "$dir/$f" | cut -f1)
-		printf '<li data-href="%s"><span>%s</span> <small>%s</small><br><button class="get">Get</button> <small class="st"></small></li>\n' \
-			"$(printf '%s' "$f" | url)" "$(printf '%s' "$f" | esc)" "$size"
+		printf '<li data-href="%s" data-size="%s"><span>%s</span> <small>%s</small><br><button class="get">Get</button> <small class="st"></small></li>\n' \
+			"$(printf '%s' "$f" | url)" "$(wc -c < "$dir/$f" | tr -d ' ')" "$(printf '%s' "$f" | esc)" "$size"
 	done
 	cat <<'HTML'
 </ul>
@@ -100,16 +102,53 @@ async function sink(name) {
 		return { kind: "memory (" + e.message + ")", write: async (c) => { parts.push(c); }, close: async () => new File(parts, name) };
 	}
 }
+// A file that has been read: its two ways out. Each wants a fresh tap (the
+// read took too long for the Get tap to count).
+function ready(li, stored, name, kind) {
+	const st = li.querySelector(".st");
+	const file = new File([stored], name, { type: "application/octet-stream" }); // a reference, not a copy
+	li.kwFile = file; li.kwSink = kind;
+	li.querySelector(".get")?.remove();
+	st.textContent = (file.size / 1048576).toFixed(1) + " MiB ready";
+	const dl = Object.assign(document.createElement("button"), { className: "save", textContent: "Download" });
+	dl.onclick = () => {
+		const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(file), download: name });
+		document.body.appendChild(a); a.click(); a.remove();
+	};
+	li.insertBefore(dl, st);
+	if (navigator.canShare && navigator.canShare({ files: [file] })) {
+		const sh = Object.assign(document.createElement("button"), { className: "share", textContent: "Share" });
+		sh.onclick = async () => {
+			if (file.size > 200 * 1048576 && !confirm("Sharing " + Math.round(file.size / 1048576) + " MiB may make the browser reload this page. Download is safer. Share anyway?")) return;
+			try { await navigator.share({ files: [file] }); } catch (e) { if (e.name !== "AbortError") st.textContent = "share failed: " + e.message; }
+		};
+		li.insertBefore(sh, st);
+	}
+}
+// A copy read earlier (before a reload, say) is offered again without reading it twice.
+(async () => {
+	try {
+		const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle("kw-share");
+		for await (const [n, h] of dir.entries()) {
+			const f = await h.getFile();
+			for (const li of document.querySelectorAll("li[data-href]")) {
+				if (li.querySelector("span").textContent.split("/").pop() === n && Number(li.dataset.size) === f.size) ready(li, f, n, "disk (kept)");
+			}
+		}
+	} catch { /* nothing kept */ }
+})();
 for (const li of document.querySelectorAll("li[data-href]")) {
 	const get = li.querySelector(".get"), st = li.querySelector(".st");
 	const name = li.querySelector("span").textContent.split("/").pop();
 	get.onclick = async () => {
 		get.disabled = true;
 		try {
+			// One file at a time is kept: the buttons of an earlier one go with its copy.
+			for (const o of document.querySelectorAll("li[data-href]")) if (o !== li && o.kwFile) { o.kwFile = null; o.querySelectorAll(".save,.share").forEach((x) => x.remove()); o.querySelector(".st").textContent = "reload this page to read this one again"; }
 			const out = await sink(name);
 			const r = await fetch(li.dataset.href);
 			if (!r.ok) throw new Error("HTTP " + r.status);
-			const total = Number(r.headers.get("content-length")) || 0;
+			const total = Number(r.headers.get("content-length")) || Number(li.dataset.size) || 0;
 			if (out.kind.startsWith("memory") && total > 200 * 1048576 && !confirm("This browser cannot buffer the file on disk, and " + Math.round(total / 1048576) + " MiB may not fit in memory: the page may reload. Go on?")) throw new Error("not read");
 			let got = 0, shown = 0;
 			for (const rd = r.body.getReader();;) {
@@ -120,20 +159,7 @@ for (const li of document.querySelectorAll("li[data-href]")) {
 			}
 			const stored = await out.close();
 			if (stored.size !== got) throw new Error("stored " + stored.size + " of " + got + " bytes");
-			const file = new File([stored], name, { type: "application/octet-stream" }); // a reference, not a copy
-			li.kwFile = file; li.kwSink = out.kind;
-			st.textContent = (got / 1048576).toFixed(1) + " MiB ready";
-			get.remove();
-			const save = Object.assign(document.createElement("button"), { className: "save", textContent: "Save" });
-			// A fresh tap: the share sheet and downloads want one, and the read above took too long to count.
-			save.onclick = async () => {
-				if (navigator.canShare && navigator.canShare({ files: [file] })) {
-					try { await navigator.share({ files: [file] }); return; } catch (e) { if (e.name === "AbortError") return; }
-				}
-				const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(file), download: name });
-				document.body.appendChild(a); a.click(); a.remove();
-			};
-			li.insertBefore(save, st);
+			ready(li, stored, name, out.kind);
 		} catch (e) {
 			st.textContent = "failed: " + e.message; get.disabled = false;
 		}
